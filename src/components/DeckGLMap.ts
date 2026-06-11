@@ -161,6 +161,16 @@ import { pinWebcam, isPinned } from '@/services/webcams/pinned-store';
 import type { WebcamEntry, WebcamCluster } from '@/generated/client/worldmonitor/webcam/v1/service_client';
 import { fetchWebcamImage } from '@/services/webcams';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
+import {
+  createCountryClickGestureTracker,
+  finishCountryClickGesture,
+  markCountryClickDrag,
+  refreshCountryClickDragSuppression,
+  shouldSuppressCountryClick,
+  startCountryClickGesture,
+  updateCountryClickGestureDrag,
+  type CountryClickGestureTracker,
+} from './map-interaction-guard';
 
 
 export type TimeRange = '1h' | '6h' | '24h' | '48h' | '7d' | 'all';
@@ -584,6 +594,47 @@ export class DeckGLMap {
   private onTimeRangeChange?: (range: TimeRange) => void;
   private onCountryClick?: (country: CountryClickPayload) => void;
   private onMapContextMenu?: (payload: { lat: number; lon: number; screenX: number; screenY: number; countryCode?: string; countryName?: string }) => void;
+  private readonly countryClickGesture: CountryClickGestureTracker = createCountryClickGestureTracker();
+  private readonly handleCountryClickPointerDown = (e: PointerEvent): void => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (e.isPrimary === false) return;
+    startCountryClickGesture(this.countryClickGesture, { x: e.clientX, y: e.clientY });
+  };
+  private readonly handleCountryClickPointerMove = (e: PointerEvent): void => {
+    if (e.isPrimary === false) return;
+    updateCountryClickGestureDrag(this.countryClickGesture, { x: e.clientX, y: e.clientY });
+  };
+  private readonly handleCountryClickPointerEnd = (): void => {
+    finishCountryClickGesture(this.countryClickGesture);
+  };
+  private readonly markCountryDragGesture = (): void => {
+    markCountryClickDrag(this.countryClickGesture);
+  };
+  private readonly refreshCountryDragSuppression = (): void => {
+    refreshCountryClickDragSuppression(this.countryClickGesture);
+  };
+  private attachMapLibreInteractionHandlers(): void {
+    if (!this.maplibreMap) return;
+    const canvas = this.maplibreMap.getCanvas();
+    canvas.addEventListener('contextmenu', this.handleContextMenu);
+    canvas.addEventListener('pointerdown', this.handleCountryClickPointerDown);
+    canvas.addEventListener('pointermove', this.handleCountryClickPointerMove);
+    canvas.addEventListener('pointerup', this.handleCountryClickPointerEnd);
+    canvas.addEventListener('pointercancel', this.handleCountryClickPointerEnd);
+    this.maplibreMap.on('dragstart', this.markCountryDragGesture);
+    this.maplibreMap.on('dragend', this.refreshCountryDragSuppression);
+  }
+  private detachMapLibreInteractionHandlers(): void {
+    if (!this.maplibreMap) return;
+    const canvas = this.maplibreMap.getCanvas();
+    this.maplibreMap.off('dragstart', this.markCountryDragGesture);
+    this.maplibreMap.off('dragend', this.refreshCountryDragSuppression);
+    canvas.removeEventListener('contextmenu', this.handleContextMenu);
+    canvas.removeEventListener('pointerdown', this.handleCountryClickPointerDown);
+    canvas.removeEventListener('pointermove', this.handleCountryClickPointerMove);
+    canvas.removeEventListener('pointerup', this.handleCountryClickPointerEnd);
+    canvas.removeEventListener('pointercancel', this.handleCountryClickPointerEnd);
+  }
   private readonly handleContextMenu = (e: MouseEvent): void => {
     e.preventDefault();
     if (!this.onMapContextMenu || !this.maplibreMap) return;
@@ -914,6 +965,7 @@ export class DeckGLMap {
       console.warn(`[DeckGLMap] Primary basemap failed, recreating with fallback: ${fallback}`);
       const attr = this.container.querySelector('.map-attribution');
       if (attr) setTrustedHtml(attr, trustedHtml('© <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>', "legacy direct innerHTML migration"));
+      this.detachMapLibreInteractionHandlers();
       this.maplibreMap?.remove();
       const fallbackEl = document.getElementById('deckgl-basemap');
       if (!fallbackEl) return;
@@ -936,6 +988,7 @@ export class DeckGLMap {
           : {}),
       });
       this.maplibreMap.on('load', () => {
+        this.attachMapLibreInteractionHandlers();
         localizeMapLabels(this.maplibreMap);
         this.initDeck();
         this.loadCountryBoundaries();
@@ -1007,7 +1060,7 @@ export class DeckGLMap {
       }
     });
 
-    this.maplibreMap.getCanvas().addEventListener('contextmenu', this.handleContextMenu);
+    this.attachMapLibreInteractionHandlers();
   }
 
   private initDeck(): void {
@@ -4623,6 +4676,7 @@ export class DeckGLMap {
     const isChoropleth = info.layer?.id ? DeckGLMap.CHOROPLETH_LAYER_IDS.has(info.layer.id) : false;
     if (!info.object || isChoropleth) {
       if (info.coordinate && this.onCountryClick) {
+        if (this.shouldSuppressCountryClickAfterDrag()) return;
         const [lon, lat] = info.coordinate as [number, number];
         let country: { code: string; name: string } | null = null;
         if (isChoropleth && info.object?.properties) {
@@ -6959,6 +7013,10 @@ export class DeckGLMap {
 
   // --- Country click + highlight ---
 
+  private shouldSuppressCountryClickAfterDrag(): boolean {
+    return shouldSuppressCountryClick(this.countryClickGesture);
+  }
+
   public setOnCountryClick(cb: (country: CountryClickPayload) => void): void {
     this.onCountryClick = cb;
   }
@@ -7328,7 +7386,7 @@ export class DeckGLMap {
 
     this.deckOverlay?.finalize();
     this.deckOverlay = null;
-    this.maplibreMap?.getCanvas().removeEventListener('contextmenu', this.handleContextMenu);
+    this.detachMapLibreInteractionHandlers();
     this.maplibreMap?.remove();
     this.maplibreMap = null;
     setTrustedHtml(this.container, trustedHtml('', "legacy direct innerHTML migration"));
